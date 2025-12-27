@@ -1,0 +1,522 @@
+// Maji Database Schema
+// Water Supply Platform for Freetown, Sierra Leone
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============== USERS ==============
+
+model User {
+  id            String    @id @default(cuid())
+  phone         String    @unique
+  name          String?
+  role          UserRole  @default(CITIZEN)
+  language      Language  @default(EN)
+  avatarUrl     String?
+  reputation    Int       @default(0)
+  isVerified    Boolean   @default(false)
+  isActive      Boolean   @default(true)
+  fcmTokens     String[]  // Firebase Cloud Messaging tokens
+
+  // Relations
+  primaryZoneId String?
+  primaryZone   Zone?     @relation(fields: [primaryZoneId], references: [id])
+
+  vendor        Vendor?
+  alerts        Alert[]
+  reports       Report[]
+  orders        Order[]   @relation("CustomerOrders")
+  ratings       Rating[]
+  notifications Notification[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([phone])
+  @@index([role])
+  @@index([primaryZoneId])
+}
+
+enum UserRole {
+  CITIZEN
+  SCOUT
+  VENDOR
+  BUSINESS
+  ADMIN
+}
+
+enum Language {
+  EN
+  KRI
+}
+
+// ============== AUTH ==============
+
+model OtpCode {
+  id        String   @id @default(cuid())
+  phone     String
+  code      String
+  expiresAt DateTime
+  verified  Boolean  @default(false)
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([phone, code])
+  @@index([expiresAt])
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([token])
+}
+
+// ============== ZONES ==============
+
+model Zone {
+  id            String    @id @default(cuid())
+  name          String
+  slug          String    @unique
+  geometry      Json      // GeoJSON Polygon
+  centroid      Json      // GeoJSON Point {type: "Point", coordinates: [lng, lat]}
+
+  // Hierarchy
+  parentId      String?
+  parent        Zone?     @relation("ZoneHierarchy", fields: [parentId], references: [id])
+  children      Zone[]    @relation("ZoneHierarchy")
+
+  // Water schedule (if known)
+  waterSchedule Json?     // {days: [], times: [], reliability: 0.7}
+
+  // Relations
+  users         User[]
+  resources     Resource[]
+  alerts        Alert[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([slug])
+  @@index([parentId])
+}
+
+// ============== VENDORS ==============
+
+model Vendor {
+  id            String    @id @default(cuid())
+  userId        String    @unique
+  user          User      @relation(fields: [userId], references: [id])
+
+  businessName  String
+  description   String?
+  phone         String
+  location      Json      // GeoJSON Point
+  address       String?
+
+  // Delivery
+  deliveryZones String[]  // Array of zone IDs
+  deliveryFee   Int       @default(0) // In Leones
+  minOrder      Int       @default(0)
+
+  // Status
+  isVerified    Boolean   @default(false)
+  isActive      Boolean   @default(true)
+  rating        Float     @default(0)
+  ratingCount   Int       @default(0)
+
+  // Business hours
+  openingHours  Json?     // {mon: {open: "08:00", close: "18:00"}, ...}
+
+  // Relations
+  products      Product[]
+  orders        Order[]
+  ratings       Rating[]
+  resources     Resource[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([isActive, isVerified])
+}
+
+model Product {
+  id            String    @id @default(cuid())
+  vendorId      String
+  vendor        Vendor    @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  name          String
+  description   String?
+  unit          String    // "20L", "bucket", "tanker"
+  price         Int       // In Leones
+  isAvailable   Boolean   @default(true)
+
+  orderItems    OrderItem[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([vendorId])
+}
+
+// ============== RESOURCES ==============
+
+model Resource {
+  id            String       @id @default(cuid())
+  zoneId        String
+  zone          Zone         @relation(fields: [zoneId], references: [id])
+
+  type          ResourceType
+  name          String
+  description   String?
+  location      Json         // GeoJSON Point
+  address       String?
+
+  // Optional vendor association
+  vendorId      String?
+  vendor        Vendor?      @relation(fields: [vendorId], references: [id])
+
+  // Status
+  status        ResourceStatus @default(ACTIVE)
+  lastVerified  DateTime?
+  verifiedBy    String?
+
+  // Metadata (type-specific)
+  metadata      Json?        // {capacity: 1000, hasElectricity: true, ...}
+
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@index([zoneId, type])
+  @@index([status])
+}
+
+enum ResourceType {
+  WATER_TAP
+  BOREHOLE
+  WELL
+  WATER_KIOSK
+  SOLAR_CHARGER
+  BATTERY_RENTAL
+  WATER_VENDOR
+  TANKER_STATION
+}
+
+enum ResourceStatus {
+  ACTIVE
+  INACTIVE
+  UNDER_REPAIR
+  UNVERIFIED
+}
+
+// ============== ORDERS ==============
+
+model Order {
+  id              String      @id @default(cuid())
+  orderNumber     String      @unique @default(cuid())
+
+  customerId      String
+  customer        User        @relation("CustomerOrders", fields: [customerId], references: [id])
+
+  vendorId        String
+  vendor          Vendor      @relation(fields: [vendorId], references: [id])
+
+  status          OrderStatus @default(PENDING)
+
+  // Delivery
+  deliveryAddress String
+  deliveryLocation Json?      // GeoJSON Point
+  deliveryNotes   String?
+
+  // Pricing
+  subtotal        Int         // In Leones
+  deliveryFee     Int
+  platformFee     Int
+  totalAmount     Int
+
+  // Timestamps
+  acceptedAt      DateTime?
+  deliveredAt     DateTime?
+  completedAt     DateTime?
+  cancelledAt     DateTime?
+  cancelReason    String?
+
+  // Relations
+  items           OrderItem[]
+  transaction     Transaction?
+  rating          Rating?
+
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@index([customerId])
+  @@index([vendorId])
+  @@index([status])
+  @@index([orderNumber])
+}
+
+enum OrderStatus {
+  PENDING
+  ACCEPTED
+  PAYMENT_PENDING
+  PAID
+  PREPARING
+  OUT_FOR_DELIVERY
+  DELIVERED
+  COMPLETED
+  CANCELLED
+  REFUNDED
+}
+
+model OrderItem {
+  id            String    @id @default(cuid())
+  orderId       String
+  order         Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  productId     String
+  product       Product   @relation(fields: [productId], references: [id])
+
+  quantity      Int
+  unitPrice     Int
+  totalPrice    Int
+
+  createdAt     DateTime  @default(now())
+
+  @@index([orderId])
+}
+
+// ============== TRANSACTIONS ==============
+
+model Transaction {
+  id            String            @id @default(cuid())
+  orderId       String            @unique
+  order         Order             @relation(fields: [orderId], references: [id])
+
+  amount        Int
+  currency      String            @default("SLL")
+
+  provider      PaymentProvider
+  providerRef   String?           // External reference
+
+  status        TransactionStatus @default(PENDING)
+
+  // Escrow
+  escrowStatus  EscrowStatus      @default(NONE)
+  escrowReleasedAt DateTime?
+
+  // Metadata
+  metadata      Json?
+
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@index([provider, providerRef])
+  @@index([status])
+}
+
+enum PaymentProvider {
+  ORANGE_MONEY
+  AFRICELL_MONEY
+  CASH
+}
+
+enum TransactionStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
+
+enum EscrowStatus {
+  NONE
+  HELD
+  RELEASED
+  REFUNDED
+}
+
+// ============== ALERTS ==============
+
+model Alert {
+  id            String      @id @default(cuid())
+
+  scoutId       String
+  scout         User        @relation(fields: [scoutId], references: [id])
+
+  zoneId        String
+  zone          Zone        @relation(fields: [zoneId], references: [id])
+
+  type          AlertType
+  message       String?
+
+  // Timing
+  eta           DateTime?   // Expected time of arrival
+  duration      Int?        // Expected duration in minutes
+
+  // Verification
+  confidence    Float       @default(0.5) // 0-1 score
+  isVerified    Boolean     @default(false)
+
+  // Feedback
+  feedbackScore Float?      // Average accuracy rating
+  feedbackCount Int         @default(0)
+
+  // Status
+  status        AlertStatus @default(ACTIVE)
+  expiresAt     DateTime?
+
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([zoneId, status])
+  @@index([scoutId])
+  @@index([createdAt])
+}
+
+enum AlertType {
+  WATER_COMING
+  WATER_ACTIVE
+  WATER_ENDED
+  SHORTAGE_WARNING
+  FLOOD_WARNING
+  TANKER_AVAILABLE
+}
+
+enum AlertStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+  VERIFIED
+}
+
+// ============== REPORTS ==============
+
+model Report {
+  id            String        @id @default(cuid())
+
+  userId        String
+  user          User          @relation(fields: [userId], references: [id])
+
+  type          ReportType
+  description   String?
+  location      Json          // GeoJSON Point
+  address       String?
+
+  // Media
+  photoUrls     String[]
+
+  // Verification
+  status        ReportStatus  @default(PENDING)
+  verifiedCount Int           @default(0) // Number of similar reports nearby
+
+  // Bounty
+  bountyAmount  Int?
+  bountyPaid    Boolean       @default(false)
+  bountyPaidAt  DateTime?
+
+  // Resolution
+  resolvedAt    DateTime?
+  resolvedBy    String?
+  resolution    String?
+
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@index([type, status])
+  @@index([userId])
+}
+
+enum ReportType {
+  LEAK
+  BURST_PIPE
+  CONTAMINATION
+  BLOCKED_DRAIN
+  FLOOD
+  BROKEN_TAP
+  OTHER
+}
+
+enum ReportStatus {
+  PENDING
+  VERIFIED
+  FORWARDED
+  IN_PROGRESS
+  RESOLVED
+  REJECTED
+}
+
+// ============== RATINGS ==============
+
+model Rating {
+  id            String    @id @default(cuid())
+
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+
+  vendorId      String
+  vendor        Vendor    @relation(fields: [vendorId], references: [id])
+
+  orderId       String    @unique
+  order         Order     @relation(fields: [orderId], references: [id])
+
+  score         Int       // 1-5
+  comment       String?
+
+  // Specific ratings
+  qualityScore  Int?      // Water quality
+  serviceScore  Int?      // Delivery service
+
+  createdAt     DateTime  @default(now())
+
+  @@index([vendorId])
+  @@index([userId])
+}
+
+// ============== NOTIFICATIONS ==============
+
+model Notification {
+  id            String              @id @default(cuid())
+
+  userId        String
+  user          User                @relation(fields: [userId], references: [id])
+
+  type          NotificationType
+  title         String
+  body          String
+  data          Json?
+
+  channel       NotificationChannel
+
+  isRead        Boolean             @default(false)
+  readAt        DateTime?
+
+  createdAt     DateTime            @default(now())
+
+  @@index([userId, isRead])
+  @@index([createdAt])
+}
+
+enum NotificationType {
+  ALERT
+  ORDER_UPDATE
+  PAYMENT
+  REPORT_UPDATE
+  BOUNTY
+  SYSTEM
+}
+
+enum NotificationChannel {
+  PUSH
+  SMS
+  IN_APP
+}
